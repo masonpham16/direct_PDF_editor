@@ -1,0 +1,7 @@
+build/
+*.o
+*.obj
+.DS_Store
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
