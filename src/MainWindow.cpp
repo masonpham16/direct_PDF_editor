@@ -143,6 +143,15 @@ MainWindow::DocumentTab *MainWindow::createTab()
     connect(tab->view, &PdfView::rotationChanged, this, &MainWindow::onRotationChanged);
     connect(tab->view, &PdfView::contextMenuRequestedAt, this, &MainWindow::onContextMenuRequested);
     connect(tab->view, &PdfView::markupsChanged, this, &MainWindow::refreshMarkupsPanel);
+    connect(tab->view, &PdfView::existingAnnotationRemoved, this, [this, tab](int sourcePage) {
+        // Removing it changed what Poppler itself renders for this page —
+        // same situation as a rotation change invalidating the cached
+        // thumbnail, just scoped to one page instead of the whole tab.
+        tab->thumbnailImageCache.remove(sourcePage);
+        if (tab == currentTab()) {
+            refreshThumbnailOrder();
+        }
+    });
     connect(tab->view, &PdfView::selectionModeChanged, this, [this](PdfView::SelectionMode mode) {
         // Keep the toolbar buttons honest even when PdfView changes mode on
         // its own (e.g. Add Text/Add Shape auto-reverting after placing one
@@ -1393,6 +1402,9 @@ bool MainWindow::doSave(DocumentTab *tab, const QString &destPath,
         }
         return notes;
     };
+    const auto removedAnnotationOrdinalsForPage = [view](int sourcePage) {
+        return view->removedAnnotationOrdinalsForPage(sourcePage);
+    };
 
     QVector<PdfWriter::PageLabel> pageLabels;
     const QHash<int, QString> labels = m_thumbnailPanel->allLabels();
@@ -1403,10 +1415,10 @@ bool MainWindow::doSave(DocumentTab *tab, const QString &destPath,
     }
 
     QString error;
-    const bool ok =
-        PdfWriter::save(tab->currentFilePath, destPath, tab->pendingTitle, tab->pendingAuthor, tab->pageOrder,
-                         tab->pendingBookmarks, tab->pendingRenames, tab->view->rotationQuarterTurns(), insertions,
-                         pageLabels, pageHasMarkups, paintMarkups, notesForPage, &error);
+    const bool ok = PdfWriter::save(tab->currentFilePath, destPath, tab->pendingTitle, tab->pendingAuthor,
+                                     tab->pageOrder, tab->pendingBookmarks, tab->pendingRenames,
+                                     tab->view->rotationQuarterTurns(), insertions, pageLabels, pageHasMarkups,
+                                     paintMarkups, notesForPage, removedAnnotationOrdinalsForPage, &error);
     if (!ok) {
         QMessageBox::warning(this, tr("Save Failed"), error);
         return false;
@@ -1503,6 +1515,9 @@ bool MainWindow::hasUnsavedChanges(DocumentTab *tab) const
         }
     }
     if (tab->view->markupCount() > 0 || tab->view->pastedImageCount() > 0) {
+        return true;
+    }
+    if (tab->view->hasRemovedExistingAnnotations()) {
         return true;
     }
     if (tab->view->rotationQuarterTurns() != 0) {
@@ -1617,10 +1632,11 @@ QString markupKindLabel(PdfView::MarkupKind kind)
 void MainWindow::refreshMarkupsPanel()
 {
     PdfView *view = currentView();
-    const int count = view ? view->markupCount() : 0;
+    const int ownCount = view ? view->markupCount() : 0;
+    const int existingCount = view ? view->existingAnnotationCount() : 0;
     const QSignalBlocker blocker(m_markupsTable);
-    m_markupsTable->setRowCount(count);
-    for (int i = 0; i < count; ++i) {
+    m_markupsTable->setRowCount(ownCount + existingCount);
+    for (int i = 0; i < ownCount; ++i) {
         const PdfView::MarkupEntry entry = view->markupEntry(i);
 
         auto *kindItem = new QTableWidgetItem(markupKindLabel(entry.kind));
@@ -1637,17 +1653,47 @@ void MainWindow::refreshMarkupsPanel()
 
         m_markupsTable->setItem(i, 3, new QTableWidgetItem(entry.note));
     }
+
+    // Existing (file-native) annotations — e.g. a highlight made in
+    // Preview — read-only in every column: no note-editing, since there's
+    // no DirectPDF-authored comment to attach here, only Remove.
+    for (int j = 0; j < existingCount; ++j) {
+        const int row = ownCount + j;
+        const PdfDocument::ExistingAnnotationInfo info = view->existingAnnotationAt(j);
+
+        auto *kindItem = new QTableWidgetItem(info.typeLabel);
+        kindItem->setFlags(kindItem->flags() & ~Qt::ItemIsEditable);
+        m_markupsTable->setItem(row, 0, kindItem);
+
+        auto *pageItem = new QTableWidgetItem(QString::number(info.pageIndex + 1));
+        pageItem->setFlags(pageItem->flags() & ~Qt::ItemIsEditable);
+        m_markupsTable->setItem(row, 1, pageItem);
+
+        auto *descriptionItem = new QTableWidgetItem(view->existingAnnotationDescription(j));
+        descriptionItem->setFlags(descriptionItem->flags() & ~Qt::ItemIsEditable);
+        m_markupsTable->setItem(row, 2, descriptionItem);
+
+        auto *noteItem = new QTableWidgetItem();
+        noteItem->setFlags(noteItem->flags() & ~Qt::ItemIsEditable);
+        m_markupsTable->setItem(row, 3, noteItem);
+    }
 }
 
 void MainWindow::onMarkupCellClicked(int row, int column)
 {
     Q_UNUSED(column);
-    currentView()->jumpToMarkup(row);
+    PdfView *view = currentView();
+    const int ownCount = view->markupCount();
+    if (row < ownCount) {
+        view->jumpToMarkup(row);
+    } else {
+        view->jumpToExistingAnnotation(row - ownCount);
+    }
 }
 
 void MainWindow::onMarkupNoteEdited(QTableWidgetItem *item)
 {
-    if (!item || item->column() != 3) {
+    if (!item || item->column() != 3 || item->row() >= currentView()->markupCount()) {
         return;
     }
     currentView()->setMarkupNote(item->row(), item->text());
@@ -1660,19 +1706,28 @@ void MainWindow::onMarkupsContextMenu(const QPoint &pos)
         return;
     }
     const int row = item->row();
+    PdfView *view = currentView();
+    const int ownCount = view->markupCount();
     QMenu menu(this);
-    if (currentView()->markupEntry(row).kind == PdfView::MarkupKind::Highlight) {
-        QAction *colorAction = menu.addAction(tr("Change Highlight Color..."));
-        connect(colorAction, &QAction::triggered, this, [this, row]() {
-            const QColor chosen =
-                QColorDialog::getColor(currentView()->highlightColor(row), this, tr("Highlight Color"));
-            if (chosen.isValid()) {
-                currentView()->setHighlightColor(row, chosen);
-            }
-        });
+    if (row < ownCount) {
+        if (view->markupEntry(row).kind == PdfView::MarkupKind::Highlight) {
+            QAction *colorAction = menu.addAction(tr("Change Highlight Color..."));
+            connect(colorAction, &QAction::triggered, this, [this, row]() {
+                const QColor chosen =
+                    QColorDialog::getColor(currentView()->highlightColor(row), this, tr("Highlight Color"));
+                if (chosen.isValid()) {
+                    currentView()->setHighlightColor(row, chosen);
+                }
+            });
+        }
+        QAction *removeAction = menu.addAction(tr("Remove"));
+        connect(removeAction, &QAction::triggered, this, [this, row]() { currentView()->removeMarkup(row); });
+    } else {
+        const int existingIndex = row - ownCount;
+        QAction *removeAction = menu.addAction(tr("Remove"));
+        connect(removeAction, &QAction::triggered, this,
+                [this, existingIndex]() { currentView()->removeExistingAnnotationAt(existingIndex); });
     }
-    QAction *removeAction = menu.addAction(tr("Remove"));
-    connect(removeAction, &QAction::triggered, this, [this, row]() { currentView()->removeMarkup(row); });
     menu.exec(m_markupsTable->viewport()->mapToGlobal(pos));
 }
 
@@ -1908,6 +1963,9 @@ void MainWindow::writeRecoverySnapshotFor(DocumentTab *tab)
         }
         return notes;
     };
+    const auto removedAnnotationOrdinalsForPage = [view](int page) {
+        return view->removedAnnotationOrdinalsForPage(page);
+    };
     // Page labels live in the single shared Pages panel widget rather than
     // per-tab, so they can only be read reliably for the active tab — a
     // background tab's recovery snapshot may miss a label typed while it
@@ -1928,7 +1986,7 @@ void MainWindow::writeRecoverySnapshotFor(DocumentTab *tab)
     const bool ok = PdfWriter::save(tab->currentFilePath, tab->recoveryFilePath, tab->pendingTitle,
                                      tab->pendingAuthor, tab->pageOrder, tab->pendingBookmarks, tab->pendingRenames,
                                      tab->view->rotationQuarterTurns(), {}, pageLabels, pageHasMarkups, paintMarkups,
-                                     notesForPage, &error);
+                                     notesForPage, removedAnnotationOrdinalsForPage, &error);
     if (!ok) {
         return; // silent — a failed autosave shouldn't interrupt the user; the next tick tries again
     }

@@ -243,3 +243,112 @@ QVector<PdfDocument::OutlineEntry> PdfDocument::outline() const
     }
     return convertOutline(m_doc->outline());
 }
+
+namespace {
+QString annotationTypeLabel(const Poppler::Annotation *annotation)
+{
+    switch (annotation->subType()) {
+    case Poppler::Annotation::AText:
+        return QStringLiteral("Note");
+    case Poppler::Annotation::ALine:
+        return QStringLiteral("Line");
+    case Poppler::Annotation::AGeom:
+        return QStringLiteral("Shape");
+    case Poppler::Annotation::AHighlight: {
+        const auto *highlight = static_cast<const Poppler::HighlightAnnotation *>(annotation);
+        switch (highlight->highlightType()) {
+        case Poppler::HighlightAnnotation::Underline:
+            return QStringLiteral("Underline");
+        case Poppler::HighlightAnnotation::Squiggly:
+            return QStringLiteral("Squiggly Underline");
+        case Poppler::HighlightAnnotation::StrikeOut:
+            return QStringLiteral("Strikethrough");
+        case Poppler::HighlightAnnotation::Highlight:
+        default:
+            return QStringLiteral("Highlight");
+        }
+    }
+    case Poppler::Annotation::AStamp:
+        return QStringLiteral("Stamp");
+    case Poppler::Annotation::AInk:
+        return QStringLiteral("Freehand");
+    case Poppler::Annotation::ACaret:
+        return QStringLiteral("Caret");
+    default:
+        return QStringLiteral("Annotation");
+    }
+}
+
+// Subtypes a user would recognize as "a markup someone placed" — excludes
+// links, form fields, and embedded-media annotations (attachment/sound/
+// movie/screen/rich media), which aren't that.
+bool isMarkupSubtype(Poppler::Annotation::SubType subType)
+{
+    switch (subType) {
+    case Poppler::Annotation::AText:
+    case Poppler::Annotation::ALine:
+    case Poppler::Annotation::AGeom:
+    case Poppler::Annotation::AHighlight:
+    case Poppler::Annotation::AStamp:
+    case Poppler::Annotation::AInk:
+    case Poppler::Annotation::ACaret:
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+QVector<PdfDocument::ExistingAnnotationInfo> PdfDocument::existingAnnotations() const
+{
+    QVector<ExistingAnnotationInfo> result;
+    if (!m_doc) {
+        return result;
+    }
+
+    for (int pageIndex = 0; pageIndex < m_doc->numPages(); ++pageIndex) {
+        std::unique_ptr<Poppler::Page> page(m_doc->page(pageIndex));
+        if (!page) {
+            continue;
+        }
+        const QSizeF pageSize = page->pageSizeF();
+        int ordinalInPage = 0;
+        for (const auto &annotation : page->annotations()) {
+            const int thisOrdinal = ordinalInPage++;
+            if (!annotation || !isMarkupSubtype(annotation->subType())) {
+                continue;
+            }
+            const QRectF normalized = annotation->boundary();
+            ExistingAnnotationInfo info;
+            info.pageIndex = pageIndex;
+            info.ordinalInPage = thisOrdinal;
+            info.typeLabel = annotationTypeLabel(annotation.get());
+            info.boundaryPoints = QRectF(normalized.x() * pageSize.width(), normalized.y() * pageSize.height(),
+                                          normalized.width() * pageSize.width(), normalized.height() * pageSize.height());
+            info.contents = annotation->contents();
+            result.append(info);
+        }
+    }
+    return result;
+}
+
+bool PdfDocument::removeExistingAnnotation(int pageIndex, int ordinalInPage) const
+{
+    if (!m_doc) {
+        return false;
+    }
+    std::unique_ptr<Poppler::Page> page(m_doc->page(pageIndex));
+    if (!page) {
+        return false;
+    }
+    auto annotations = page->annotations();
+    if (ordinalInPage < 0 || ordinalInPage >= static_cast<int>(annotations.size())) {
+        return false;
+    }
+    page->removeAnnotation(annotations[ordinalInPage].get());
+    // removeAnnotation() already frees the underlying core object; letting
+    // our own copy's destructor run too (when `annotations` goes out of
+    // scope below) would free it a second time and crash.
+    annotations[ordinalInPage].release();
+    return true;
+}

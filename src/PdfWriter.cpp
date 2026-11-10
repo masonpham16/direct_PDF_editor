@@ -237,7 +237,8 @@ bool PdfWriter::save(const QString &sourcePath, const QString &destPath, const Q
                       int rotationQuarterTurns, const QVector<ExternalInsertion> &insertions,
                       const QVector<PageLabel> &pageLabels, const std::function<bool(int)> &pageHasMarkups,
                       const std::function<void(int, QPainter &)> &paintMarkups,
-                      const std::function<QVector<NoteAnchor>(int)> &notesForPage, QString *errorMessage)
+                      const std::function<QVector<NoteAnchor>(int)> &notesForPage,
+                      const std::function<QVector<int>(int)> &removedAnnotationOrdinalsForPage, QString *errorMessage)
 {
     // qpdf reads lazily from the source file as it writes the output, so
     // writing directly over sourcePath while it's still the open source
@@ -393,6 +394,31 @@ bool PdfWriter::save(const QString &sourcePath, const QString &destPath, const Q
                 const double heightPts = pageVisualHeightPts(pages[i]);
                 for (const NoteAnchor &note : notes) {
                     addNoteAnnotation(qpdf, pages[i], heightPts, note);
+                }
+            }
+        }
+
+        if (removedAnnotationOrdinalsForPage) {
+            for (int i = 0; i < int(pages.size()); ++i) {
+                const int srcIndex = sourceIndexForPages[i];
+                if (srcIndex < 0) {
+                    continue;
+                }
+                QVector<int> ordinals = removedAnnotationOrdinalsForPage(srcIndex);
+                if (ordinals.isEmpty()) {
+                    continue;
+                }
+                QPDFObjectHandle annots = pages[i].getKey("/Annots");
+                if (!annots.isArray()) {
+                    continue;
+                }
+                // Highest ordinal first, so erasing one doesn't shift the
+                // array positions of the others still to be erased.
+                std::sort(ordinals.begin(), ordinals.end(), std::greater<int>());
+                for (int ordinal : ordinals) {
+                    if (ordinal >= 0 && ordinal < annots.getArrayNItems()) {
+                        annots.eraseItem(ordinal);
+                    }
                 }
             }
         }

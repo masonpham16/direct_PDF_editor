@@ -5,6 +5,7 @@
 #include <QAbstractScrollArea>
 #include <QColor>
 #include <QHash>
+#include <QPair>
 #include <QSet>
 #include <QVector>
 
@@ -252,6 +253,36 @@ public:
     };
     QVector<NoteExport> notesForPage(int sourcePage) const;
 
+    // --- Existing (file-native) annotations, e.g. from Preview or Acrobat ---
+    // Markups already in the file when it was opened, as opposed to
+    // anything placed in this DirectPDF session. Deliberately a separate,
+    // simpler surface from the unified markup list above: read (listed in
+    // the Markups panel) and remove, nothing else — no notes, no color
+    // editing, and removal is an immediate, direct edit (like Insert Pages
+    // From File) rather than something Undo covers, since un-deleting one
+    // would mean faithfully reconstructing whatever PDF object another
+    // tool wrote, for every possible annotation subtype — not worth the
+    // complexity for something this infrequent. Merely having one of
+    // these present (untouched) is NOT an unsaved change; only actually
+    // removing one is (see hasRemovedExistingAnnotations()).
+    //
+    // Click one directly on the page (same as clicking an embedded image
+    // or a placed shape) to select it, then Delete/Backspace to remove it
+    // — same gesture as every other removable object, in addition to the
+    // Markups panel's right-click → Remove.
+    int existingAnnotationCount() const { return m_existingAnnotations.size(); }
+    PdfDocument::ExistingAnnotationInfo existingAnnotationAt(int index) const;
+    // The annotation's own /Contents text if it has one, else a snippet of
+    // the page text underneath it (for highlight-style annotations), else
+    // just its type name.
+    QString existingAnnotationDescription(int index); // not const: may populate the page-text cache, like textForRange()
+    void removeExistingAnnotationAt(int index);
+    void jumpToExistingAnnotation(int index); // scrolls to its page only — no on-page selection chrome
+    bool hasRemovedExistingAnnotations() const { return !m_removedAnnotationOrdinals.isEmpty(); }
+    // (sourcePageIndex, ordinalInPage) pairs removed this session, for
+    // PdfWriter::save() to strip the matching /Annots entries on Save.
+    QVector<int> removedAnnotationOrdinalsForPage(int sourcePage) const;
+
     // --- Text box formatting (used by FormatPanel) ---
     // The live rich-text editor while a text box is actively being edited
     // (double-clicked, or just placed), or nullptr otherwise. FormatPanel
@@ -354,6 +385,11 @@ signals:
     // added, removed, or has its note edited — the Markups panel listens
     // to this to refresh its list.
     void markupsChanged();
+    // Fires whenever an existing (file-native) annotation is removed —
+    // unlike highlights/text boxes/shapes, this changes what Poppler
+    // itself renders for sourcePage, so anything caching a rendered image
+    // of that page (the Pages panel's thumbnails) needs to re-render it.
+    void existingAnnotationRemoved(int sourcePage);
     // Fires whenever a NEW user edit changes highlights/text boxes/shapes/
     // pasted images — add, remove, or commit (color/note edits too), but
     // NOT restoreMarkupSnapshot() itself, so MainWindow's undo stack
@@ -363,6 +399,7 @@ signals:
     void sessionContentChanged();
 
 protected:
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
@@ -398,6 +435,12 @@ private:
     // than translating from a source index first — used for Home/End, which
     // should mean "first/last page as currently arranged."
     void goToDisplayPosition(int displayIndex);
+    // Scrolls so rectPoints (natural, unrotated page point space) on
+    // sourcePage is vertically centered in the viewport — used when
+    // jumping to a markup from the Markups panel, so the thing you clicked
+    // is actually visible and in view, not just "somewhere on this page
+    // you're now scrolled to the top of".
+    void scrollToShowRect(int sourcePage, const QRectF &rectPoints);
     const QVector<PdfTextWord> &wordsForPage(int pageIndex);
     TextPos nearestCharPos(int pageIndex, const QPointF &pdfPoint) const;
     QVector<QRectF> selectionRowRects(int pageIndex, TextPos lo, TextPos hi) const;
@@ -409,6 +452,8 @@ private:
     qreal pageLeft(int pageIndex) const;
     QPointF projectToPage(int pageIndex, const QPoint &viewportPos) const;
     int pastedImageAt(int pageIndex, const QPointF &pdfPoint) const;
+    // Index into m_existingAnnotations of the one at pdfPoint on pageIndex, or -1.
+    int existingAnnotationAt(int pageIndex, const QPointF &pdfPoint) const;
     QRect pageScreenRect(int pageIndex) const;
     int textBoxAt(int pageIndex, const QPointF &pdfPoint) const;
     void startEditingTextBox(int index);
@@ -504,6 +549,16 @@ private:
 
     QVector<HighlightAnnotation> m_highlights;
     QColor m_defaultHighlightColor = QColor(255, 235, 59); // soft yellow, the common highlighter color
+
+    // This session's still-present existing (file-native) annotations —
+    // shrinks as the user removes entries (see removeExistingAnnotationAt()).
+    QVector<PdfDocument::ExistingAnnotationInfo> m_existingAnnotations;
+    // (sourcePageIndex, ordinalInPage) for every one removed this session —
+    // unlike m_existingAnnotations above, entries here are never removed,
+    // since PdfWriter::save() needs the full list at Save time, however
+    // long ago in the session each removal happened.
+    QVector<QPair<int, int>> m_removedAnnotationOrdinals;
+    int m_selectedExistingAnnotationIndex = -1; // index into m_existingAnnotations, or -1
 
     // "Sticky" style state: whenever the user adjusts a text box's border/
     // fill, or its font/color while editing, remembered here so the next

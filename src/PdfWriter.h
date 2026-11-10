@@ -90,6 +90,12 @@ public:
     //     /PageLabels tree (prefix-only, no numbering style) — a real,
     //     standard PDF mechanism other viewers' page-label displays will
     //     also show, not just DirectPDF. Keyed by *original* page index.
+    //   removedAnnotationOrdinalsForPage: for each *original* page index,
+    //     returns the ordinal positions (within that page's own, pre-edit
+    //     /Annots array — see PdfDocument::ExistingAnnotationInfo) of any
+    //     existing, file-native annotations the user removed this session
+    //     (e.g. a highlight made in Preview) — erased from /Annots in the
+    //     saved output. Pass an empty std::function if none were removed.
     struct PageLabel {
         int sourcePageIndex = 0;
         QString text;
@@ -100,7 +106,8 @@ public:
                       int rotationQuarterTurns, const QVector<ExternalInsertion> &insertions,
                       const QVector<PageLabel> &pageLabels, const std::function<bool(int)> &pageHasMarkups,
                       const std::function<void(int, QPainter &)> &paintMarkups,
-                      const std::function<QVector<NoteAnchor>(int)> &notesForPage, QString *errorMessage);
+                      const std::function<QVector<NoteAnchor>(int)> &notesForPage,
+                      const std::function<QVector<int>(int)> &removedAnnotationOrdinalsForPage, QString *errorMessage);
 
     // Reads back labels written by save() above: a /PageLabels /Nums entry
     // counts as a DirectPDF-style label only if it sets /P (prefix text)

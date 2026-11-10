@@ -5,9 +5,11 @@
 #include <QString>
 #include <QVector>
 #include <memory>
+#include <vector>
 
 namespace Poppler {
 class Document;
+class Annotation;
 }
 class PDFDoc; // poppler core, used only for image geometry (see imageBoxes())
 
@@ -78,6 +80,35 @@ public:
         QVector<OutlineEntry> children;
     };
     QVector<OutlineEntry> outline() const;
+
+    // A markup-type annotation (highlight, underline, note, shape, ink,
+    // etc.) already present in the file — from Preview, Acrobat, or any
+    // other PDF tool, as opposed to something placed in this DirectPDF
+    // session.
+    struct ExistingAnnotationInfo {
+        int pageIndex = -1;
+        // Position within this page's raw /Annots array (counting every
+        // annotation, not just markup-type ones) — a stable identifier
+        // PdfWriter::save() uses to delete the matching entry from the
+        // file's own /Annots array.
+        int ordinalInPage = -1;
+        QString typeLabel;     // "Highlight", "Underline", "Note", "Shape", "Freehand", ...
+        QRectF boundaryPoints; // PDF point space, top-left origin — same convention as PdfTextWord::bbox
+        QString contents;      // the annotation's own /Contents text (e.g. a sticky-note comment), often empty
+    };
+    // Enumerates every markup-type annotation across the whole file (skips
+    // links, form widgets, and embedded-media annotations — not something
+    // a user would think of as "a markup"). Recomputed fresh on every
+    // call — cheap, since it's just metadata, no rendering — so this is
+    // deliberately NOT cached here; callers that want to hang on to the
+    // result (PdfView does, for the Markups panel) cache it themselves.
+    QVector<ExistingAnnotationInfo> existingAnnotations() const;
+    // Removes the annotation at ordinalInPage (see ExistingAnnotationInfo)
+    // from the live, in-memory document — renderPage() stops drawing it
+    // immediately. This does NOT touch the file on disk; PdfWriter::save()
+    // is separately responsible for removing the matching entry from the
+    // file's own /Annots array. Returns false if the position is invalid.
+    bool removeExistingAnnotation(int pageIndex, int ordinalInPage) const;
 
 private:
     std::unique_ptr<Poppler::Document> m_doc;

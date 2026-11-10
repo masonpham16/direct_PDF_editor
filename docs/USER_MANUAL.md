@@ -78,7 +78,7 @@ The **Tools** tab (in the same tabbed panel as Pages/Bookmarks/Markups — see S
 Every highlight, text box, and shape you place ends up as a row in the **Markups** panel — one place to see everything you've put on the document, jump straight to any of it, and leave yourself a note about it (similar to Bluebeam Revu's markups list).
 
 - The **Markups panel** lists every placed item with four columns: **Type** (Highlight / Text / Shape), **Page**, a **Description** (a text snippet for highlights and text boxes, or the shape's name — "Rectangle", "Arrow", etc. — for shapes), and a **Note** column of your own.
-- **Click any row** to jump straight to that item's page.
+- **Click any row** to jump straight to that item — scrolled into view and selected, not just "somewhere on the right page."
 - **Double-click the Note cell** (or press the edit key) to type a comment, then click away or press Enter to save it.
 - **Right-click a row** for **Remove**, which deletes both the row and the item itself from the page; a highlight row also offers **Change Highlight Color...**.
 - A row appears the moment the item is actually placed — for a text box, that means once you click away or otherwise finish typing (an empty box you abandon without typing anything never appears, same as it's discarded entirely).
@@ -87,6 +87,16 @@ Highlights specifically also have a dedicated way to create them:
 - **Highlight** (`Ctrl+H`, toolbar button, Edit menu, or right-click menu): select some text first, then trigger this — the selection turns into a highlight on the page and a new row appears in the Markups panel. If nothing is selected, it does nothing (a status bar message reminds you to select text first).
 - New highlights default to yellow, but **right-click a highlight's row in the Markups panel → Change Highlight Color...** to recolor it — the color you pick also becomes the default for the next highlight you create, like the border/fill defaults for text boxes and shapes.
 - Unlike the brief orange flash a bookmark jump gives you (above), a highlight stays on the page permanently.
+
+### Markups from other PDF tools
+
+Opening a file that already has markups from another program — a highlight made in Preview, a comment added in Acrobat, etc. — lists those too, in the same Markups panel, below your own:
+
+- Shown with their real type (Highlight, Underline, Note, Shape, Freehand, ...) and, as the Description, that annotation's own comment text if it has one, else a snippet of whatever page text it covers.
+- **Click a row** to jump to its page, same as any other markup. **Click the annotation directly on the page** (same as clicking an embedded image or one of your own shapes) to select it there instead, then **Delete/Backspace** to remove it — same gesture as every other removable object.
+- **Right-click a row → Remove** (or Delete/Backspace after clicking it on the page) deletes it — gone from the page immediately, and from the file's own annotations on your next Save.
+- These are read-only otherwise: no Note column (there's no DirectPDF-authored comment to attach to someone else's annotation), and removing one is an immediate, direct edit rather than something **Undo** covers — reconstructing whatever another program's annotation originally was isn't something Undo can faithfully reverse, so treat Remove here as final.
+- Just having one of these present doesn't by itself count as an unsaved change — only actually removing one does.
 
 ## Placing Objects
 
@@ -159,6 +169,7 @@ What gets saved:
 - **Page rotation** (Rotate Clockwise/Counterclockwise) — applied to every page, stacked on top of whatever rotation the page already had.
 - **Notes** on highlights/text boxes/shapes — written as real PDF comment (sticky-note) annotations, positioned at the item they belong to. Other PDF viewers can see and read these too, not just DirectPDF.
 - **Page labels** (the Pages panel's free-text name field) — written using the PDF format's own page-label mechanism, so other viewers' page navigators show them too. Reopening a file saved by DirectPDF restores them into the Label fields correctly; a label written by some *other* tool is only picked up if it's a plain text label with no page-numbering style attached (DirectPDF won't misread an ordinary roman-numeral/decimal numbering scheme as a label).
+- **Removal of a markup from another PDF tool** (see Markups above) — if you removed one, it's gone from the file's own annotations list, not just hidden on screen.
 
 What does *not* currently get saved (planned for later):
 - Bookmark text highlights (only the page jump target is saved)

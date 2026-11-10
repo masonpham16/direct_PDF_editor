@@ -6,6 +6,7 @@
 #include <QKeyEvent>
 #include <QLineF>
 #include <QMouseEvent>
+#include <QNativeGestureEvent>
 #include <QPainter>
 #include <QPolygon>
 #include <QScrollBar>
@@ -162,11 +163,14 @@ bool PdfView::openFile(const QString &filePath, QString *errorMessage)
     m_pastedImages.clear();
     m_draggingPastedIndex = -1;
     m_selectedPastedIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
     m_searchPage = -1;
     m_searchStart = {};
     m_searchEnd = {};
     m_highlights.clear();
     m_bookmarkedPages.clear();
+    m_existingAnnotations = m_doc.existingAnnotations();
+    m_removedAnnotationOrdinals.clear();
 
     // Discard (not commit) any in-progress edit — it belongs to the
     // document being replaced.
@@ -699,7 +703,8 @@ void PdfView::jumpToMarkup(int index)
     // page, there'd be no way to tell from the main view which one a given
     // Markups panel row refers to. Clear every other selection kind first
     // so exactly one thing ever looks selected at a time.
-    const bool hadObjectSelection = m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0 || m_selectedShapeIndex >= 0;
+    const bool hadObjectSelection = m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0
+        || m_selectedShapeIndex >= 0 || m_selectedExistingAnnotationIndex >= 0;
     m_selPage = -1;
     m_selAnchor = {};
     m_selHead = {};
@@ -707,6 +712,7 @@ void PdfView::jumpToMarkup(int index)
     m_selectedPastedIndex = -1;
     m_selectedTextBoxIndex = -1;
     m_selectedShapeIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
     if (hadObjectSelection) {
         emit textBoxStateChanged();
     }
@@ -719,11 +725,20 @@ void PdfView::jumpToMarkup(int index)
 
     if (index < m_textBoxes.size()) {
         m_selectedTextBoxIndex = index;
-        goToPage(m_textBoxes[index].page);
+        scrollToShowRect(m_textBoxes[index].page, m_textBoxes[index].rectPoints);
     } else {
         const int shapeIndex = index - m_textBoxes.size();
         m_selectedShapeIndex = shapeIndex;
-        goToPage(m_shapes[shapeIndex].page);
+        const ShapeObject &shape = m_shapes[shapeIndex];
+        if (isPolygonShape(shape.kind)) {
+            QRectF bbox;
+            for (const QPointF &pt : shape.polygonPoints) {
+                bbox = bbox.isNull() ? QRectF(pt, QSizeF(0, 0)) : bbox.united(QRectF(pt, QSizeF(0, 0)));
+            }
+            scrollToShowRect(shape.page, bbox);
+        } else {
+            scrollToShowRect(shape.page, shape.rectPoints.normalized());
+        }
     }
     viewport()->update();
     emit textBoxStateChanged();
@@ -894,6 +909,16 @@ void PdfView::goToDisplayPosition(int displayIndex)
     verticalScrollBar()->setValue(int(m_layout[displayIndex].top));
 }
 
+void PdfView::scrollToShowRect(int sourcePage, const QRectF &rectPoints)
+{
+    const int displayIndex = displayForSource(sourcePage);
+    if (displayIndex < 0 || displayIndex >= m_layout.size()) {
+        return;
+    }
+    const qreal centerY = m_layout[displayIndex].top + rectPoints.center().y() * scaleFactor();
+    verticalScrollBar()->setValue(qMax(0, int(centerY - viewport()->height() / 2.0)));
+}
+
 void PdfView::goToPage(int pageIndex)
 {
     goToDisplayPosition(displayForSource(pageIndex));
@@ -976,6 +1001,7 @@ void PdfView::setSelectionMode(SelectionMode mode)
     m_selectedPastedIndex = -1;
     m_selectedTextBoxIndex = -1;
     m_selectedShapeIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
     m_placingShape = false;
     m_shapePlacingPage = -1;
     m_placingPolygon = false;
@@ -1055,6 +1081,7 @@ void PdfView::selectAllOnPage()
 
     m_regionPage = -1;
     m_selectedPastedIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
     m_selPage = m_currentPage;
     m_selAnchor = {first, 0};
     m_selHead = {last, int(words[last].charBoxes.size()) - 1};
@@ -1100,6 +1127,17 @@ int PdfView::pastedImageAt(int pageIndex, const QPointF &pdfPoint) const
     for (int i = m_pastedImages.size() - 1; i >= 0; --i) {
         const PastedImage &obj = m_pastedImages[i];
         if (obj.page == pageIndex && obj.rectPoints.contains(pdfPoint)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int PdfView::existingAnnotationAt(int pageIndex, const QPointF &pdfPoint) const
+{
+    for (int i = m_existingAnnotations.size() - 1; i >= 0; --i) {
+        const PdfDocument::ExistingAnnotationInfo &info = m_existingAnnotations[i];
+        if (info.pageIndex == pageIndex && info.boundaryPoints.contains(pdfPoint)) {
             return i;
         }
     }
@@ -1282,6 +1320,7 @@ void PdfView::startEditingTextBox(int index)
     m_editingTextBoxIndex = index;
     m_selectedTextBoxIndex = index;
     m_selectedPastedIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
     const TextBoxObject &obj = m_textBoxes[index];
 
     m_textEditWidget = new QTextEdit(viewport());
@@ -1688,6 +1727,14 @@ void PdfView::deleteSelectedObject()
         emit textBoxStateChanged();
         emit markupsChanged();
         emit sessionContentChanged();
+        return;
+    }
+    if (m_selectedExistingAnnotationIndex >= 0 && m_selectedExistingAnnotationIndex < m_existingAnnotations.size()) {
+        // Not an emit sessionContentChanged() here, same as the Markups
+        // panel's Remove action — removing a file-native annotation isn't
+        // Undo-covered (see removeExistingAnnotationAt's header comment).
+        removeExistingAnnotationAt(m_selectedExistingAnnotationIndex);
+        emit textBoxStateChanged();
     }
 }
 
@@ -1752,6 +1799,92 @@ QVector<PdfView::NoteExport> PdfView::notesForPage(int sourcePage) const
             }
         } else {
             result.append({obj.rectPoints.normalized(), obj.note});
+        }
+    }
+    return result;
+}
+
+PdfDocument::ExistingAnnotationInfo PdfView::existingAnnotationAt(int index) const
+{
+    if (index < 0 || index >= m_existingAnnotations.size()) {
+        return {};
+    }
+    return m_existingAnnotations[index];
+}
+
+QString PdfView::existingAnnotationDescription(int index)
+{
+    if (index < 0 || index >= m_existingAnnotations.size()) {
+        return {};
+    }
+    const PdfDocument::ExistingAnnotationInfo &info = m_existingAnnotations[index];
+    if (!info.contents.trimmed().isEmpty()) {
+        return snippetOf(info.contents);
+    }
+
+    // No author-written comment — for a highlight-style markup, fall back
+    // to a snippet of whatever page text the annotation's box covers, same
+    // idea as how a DirectPDF-made highlight describes itself.
+    QString underlyingText;
+    for (const PdfTextWord &word : wordsForPage(info.pageIndex)) {
+        if (word.bbox.intersects(info.boundaryPoints)) {
+            if (!underlyingText.isEmpty()) {
+                underlyingText += QLatin1Char(' ');
+            }
+            underlyingText += word.text;
+        }
+    }
+    if (!underlyingText.trimmed().isEmpty()) {
+        return snippetOf(underlyingText);
+    }
+    return tr("%1 annotation").arg(info.typeLabel);
+}
+
+void PdfView::removeExistingAnnotationAt(int index)
+{
+    if (index < 0 || index >= m_existingAnnotations.size()) {
+        return;
+    }
+    const PdfDocument::ExistingAnnotationInfo info = m_existingAnnotations[index];
+    m_doc.removeExistingAnnotation(info.pageIndex, info.ordinalInPage);
+    m_removedAnnotationOrdinals.append({info.pageIndex, info.ordinalInPage});
+    m_existingAnnotations.remove(index);
+    if (m_selectedExistingAnnotationIndex == index) {
+        m_selectedExistingAnnotationIndex = -1;
+    } else if (m_selectedExistingAnnotationIndex > index) {
+        --m_selectedExistingAnnotationIndex;
+    }
+    clearImageCache(); // the page's rendered image was baked with this annotation in it
+    viewport()->update();
+    emit markupsChanged();
+    emit existingAnnotationRemoved(info.pageIndex);
+}
+
+void PdfView::jumpToExistingAnnotation(int index)
+{
+    if (index < 0 || index >= m_existingAnnotations.size()) {
+        return;
+    }
+    m_selPage = -1;
+    m_selAnchor = {};
+    m_selHead = {};
+    m_regionPage = -1;
+    m_selectedPastedIndex = -1;
+    m_selectedTextBoxIndex = -1;
+    m_selectedShapeIndex = -1;
+    const PdfDocument::ExistingAnnotationInfo &info = m_existingAnnotations[index];
+    m_selectedExistingAnnotationIndex = index;
+    scrollToShowRect(info.pageIndex, info.boundaryPoints);
+    viewport()->update();
+    emit textBoxStateChanged();
+}
+
+QVector<int> PdfView::removedAnnotationOrdinalsForPage(int sourcePage) const
+{
+    QVector<int> result;
+    for (const QPair<int, int> &removed : m_removedAnnotationOrdinals) {
+        if (removed.first == sourcePage) {
+            result.append(removed.second);
         }
     }
     return result;
@@ -1959,6 +2092,28 @@ void PdfView::paintPageMarkups(QPainter &painter, int sourcePage, const QPointF 
                 painter.drawRect(r);
                 drawResizeHandles(painter, r);
             }
+            painter.restore();
+        }
+    }
+
+    // The selected existing (file-native) annotation, if any on this page
+    // — nothing of ours to actually draw (it's already baked into the
+    // page image Poppler rendered), just a selection outline so there's
+    // visible feedback for what Delete/Backspace is about to remove.
+    if (interactive && m_selectedExistingAnnotationIndex >= 0
+        && m_selectedExistingAnnotationIndex < m_existingAnnotations.size()) {
+        const PdfDocument::ExistingAnnotationInfo &info = m_existingAnnotations[m_selectedExistingAnnotationIndex];
+        if (info.pageIndex == sourcePage) {
+            const QRectF &b = info.boundaryPoints;
+            const QRectF r(origin.x() + b.left() * scale, origin.y() + b.top() * scale, b.width() * scale,
+                           b.height() * scale);
+            painter.save();
+            QPen pen(QColor(30, 110, 255));
+            pen.setWidth(2);
+            pen.setStyle(Qt::DashLine);
+            painter.setPen(pen);
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(r);
             painter.restore();
         }
     }
@@ -2450,6 +2605,7 @@ void PdfView::mousePressEvent(QMouseEvent *event)
             m_regionPage = -1;
             m_selectedPastedIndex = -1;
             m_selectedShapeIndex = -1;
+            m_selectedExistingAnnotationIndex = -1;
             m_selectedTextBoxIndex = hitText;
             m_draggingTextBoxIndex = hitText;
             m_textDragGrabOffset = pt - m_textBoxes[hitText].rectPoints.topLeft();
@@ -2466,6 +2622,7 @@ void PdfView::mousePressEvent(QMouseEvent *event)
             m_regionPage = -1;
             m_selectedPastedIndex = -1;
             m_selectedTextBoxIndex = -1;
+            m_selectedExistingAnnotationIndex = -1;
             m_selectedShapeIndex = hitShape;
             if (isPolygonShape(m_shapes[hitShape].kind)) {
                 m_draggingShapeIndex = hitShape;
@@ -2488,19 +2645,37 @@ void PdfView::mousePressEvent(QMouseEvent *event)
             m_regionPage = -1;
             m_selectedTextBoxIndex = -1;
             m_selectedShapeIndex = -1;
+            m_selectedExistingAnnotationIndex = -1;
             m_selectedPastedIndex = hitPasted;
             m_draggingPastedIndex = hitPasted;
             m_dragGrabOffset = pt - m_pastedImages[hitPasted].rectPoints.topLeft();
             viewport()->update();
             return;
         }
+
+        const int hitExisting = existingAnnotationAt(page, pt);
+        if (hitExisting >= 0) {
+            m_selPage = -1;
+            m_selAnchor = {};
+            m_selHead = {};
+            m_regionPage = -1;
+            m_selectedTextBoxIndex = -1;
+            m_selectedShapeIndex = -1;
+            m_selectedPastedIndex = -1;
+            m_selectedExistingAnnotationIndex = hitExisting;
+            viewport()->update();
+            emit textBoxStateChanged();
+            return;
+        }
     }
-    if (m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0 || m_selectedShapeIndex >= 0) {
+    if (m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0 || m_selectedShapeIndex >= 0
+        || m_selectedExistingAnnotationIndex >= 0) {
         emit textBoxStateChanged();
     }
     m_selectedPastedIndex = -1;
     m_selectedTextBoxIndex = -1;
     m_selectedShapeIndex = -1;
+    m_selectedExistingAnnotationIndex = -1;
 
     if (m_mode == SelectionMode::Region) {
         m_selPage = -1;
@@ -2863,6 +3038,21 @@ bool PdfView::eventFilter(QObject *watched, QEvent *event)
     return QAbstractScrollArea::eventFilter(watched, event);
 }
 
+bool PdfView::event(QEvent *event)
+{
+    // Trackpad pinch-to-zoom arrives as a native gesture, not a wheel
+    // event — Ctrl+scroll (wheelEvent below) is a separate, deliberate
+    // zoom gesture that pinch doesn't go through at all.
+    if (event->type() == QEvent::NativeGesture) {
+        auto *gestureEvent = static_cast<QNativeGestureEvent *>(event);
+        if (gestureEvent->gestureType() == Qt::ZoomNativeGesture) {
+            setZoom(zoom() * (1.0 + gestureEvent->value()));
+            return true;
+        }
+    }
+    return QAbstractScrollArea::event(event);
+}
+
 void PdfView::wheelEvent(QWheelEvent *event)
 {
     if (event->modifiers() & Qt::ControlModifier) {
@@ -2907,7 +3097,8 @@ void PdfView::keyPressEvent(QKeyEvent *event)
         return;
     }
     if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
-        if (m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0 || m_selectedShapeIndex >= 0) {
+        if (m_selectedPastedIndex >= 0 || m_selectedTextBoxIndex >= 0 || m_selectedShapeIndex >= 0
+            || m_selectedExistingAnnotationIndex >= 0) {
             deleteSelectedObject();
             event->accept();
             return;
